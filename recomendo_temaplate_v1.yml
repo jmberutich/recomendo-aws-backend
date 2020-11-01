@@ -1,0 +1,1189 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Recomendo.AI - Hadoop High Availability Cluster Definition
+Parameters:
+  ClusterId:
+    ConstraintDescription: Only letters, numbers and '_' and '-'' symbols
+    Description: the cluster's name
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9_\\-]+"
+    Type: 'String'
+  InternalDomainZone:
+    # AllowedPattern: "^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9]\\.[a-zA-Z]{2,}$"
+    ConstraintDescription: registered route 53 internal domain
+    Description: a registered to be used internally prefixed.  ClusterId.InternalDomainZone
+    Type: String
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: the cluster core AZ
+  VpcId:
+    Description: the VPC to deploy the Cluster
+    Type: 'AWS::EC2::VPC::Id'
+  ClusterInstanceType:
+    Type: String
+  VpcCidrBlock:
+    Type: String
+    AllowedValues:
+      - 10.10.0.0/16
+      - 10.11.0.0/16
+      - 10.12.0.0/16
+      - 10.13.0.0/16
+      - 10.14.0.0/16
+  S3ConfigBucket:
+    Type: "String"
+    Description: s3 bucket used to store shared configuration
+    ConstraintDescription: s3 bucket
+  ClusterKeyName:
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+    Type: 'AWS::EC2::KeyPair::KeyName'
+  MasterNodeAmi:
+    Type: AWS::EC2::Image::Id
+    AllowedValues:
+      - ami-ea505c93
+  ServiceNetworksNumber:
+      Type: List<Number>
+      Default: 121,122,123
+  ClusterNetworksNumber:
+    Type: List<Number>
+    Default: 111,112,113
+  PrivateDmzNetworksNumber:
+      Type: List<Number>
+      Default: 101,102,103
+  NatGateway:
+    Type: String
+  JumpboxSecurityGroup:
+    Description: the jump box linux security group
+    Type: AWS::EC2::SecurityGroup::Id
+  DockerDesiredCapacity:
+    Description: Docker cluster nodes
+    Type: Number
+  DockerInstanceType:
+    Description: Docker instance type
+    Type: String
+    Default: m5.xlarge
+    AllowedValues:
+      - m5.xlarge
+
+Resources:
+#
+# Security Groups definition
+#
+  HadoopNodeSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: Allow all traffic to the cluster nodes
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref ClusterId, 'hadoop-node','sg']]
+  DockerContainerSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: Allow traffic to the docker container
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref ClusterId, 'docker-container','sg']]
+  LambdasSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: Allow traffic to the lambda functions
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref ClusterId, 'lambdas','sg']]
+  VpcEndpointSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: Allow traffic to the VPC endpoints
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref ClusterId, 'vpc-endpoints','sg']]
+
+
+# Allow all traffic between hadoop nodes
+  HadoopNodesIngress:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref HadoopNodeSG
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref HadoopNodeSG
+# Allow  all traffic from lambdas
+  HadoopNodesLambdasIngress:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref HadoopNodeSG
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref LambdasSG
+#Allow all traffic from the jumpbox
+  SHHadoopNodeJumpBoxIngress:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref HadoopNodeSG
+      IpProtocol: tcp
+      FromPort: '0'
+      ToPort: '65535'
+      SourceSecurityGroupId: !Ref JumpboxSecurityGroup
+#Allow all traffic from VpcEnpointSG to lambdas
+  LambdaVpcEndpointSGIngress:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref LambdasSG
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref VpcEndpointSG
+#Allow all traffic from Lambdas to VpcEndpointSG
+  VpcEndpointLambdaSGIngress:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref VpcEndpointSG
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref LambdasSG
+  VpcEndpointDockerContainerSGIngress:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref VpcEndpointSG
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref DockerContainerSG
+  HadoopNodesContainerSGIngress:
+      Type: 'AWS::EC2::SecurityGroupIngress'
+      Properties:
+        GroupId: !Ref VpcEndpointSG
+        IpProtocol: -1
+        SourceSecurityGroupId: !Ref HadoopNodeSG
+
+#
+# Private DMZ networks
+#
+  PrivateDmzSubnetA:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs
+          Ref: 'AWS::Region'
+      CidrBlock: !Select [ !Select [0, !Ref PrivateDmzNetworksNumber], !Cidr [ !Ref VpcCidrBlock, "256", "8"]]
+
+      Tags:
+        - Key: "Name"
+          Value: !Join ['-', [ !Ref ClusterId,  'priv-dmz','a']]
+      VpcId: !Ref VpcId
+  PrivateDmzSubnetB:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs
+          Ref: 'AWS::Region'
+      CidrBlock: !Select [ !Select [1, !Ref PrivateDmzNetworksNumber], !Cidr [!Ref VpcCidrBlock, "256", "8"]]
+
+      Tags:
+        - Key: "Name"
+          Value: !Join ['-', [ !Ref ClusterId,  'priv-dmz','b']]
+      VpcId: !Ref VpcId
+  PrivateDmzSubnetC:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Select
+        - 2
+        - !GetAZs
+          Ref: 'AWS::Region'
+      CidrBlock: !Select [ !Select [2, !Ref PrivateDmzNetworksNumber], !Cidr [!Ref VpcCidrBlock, "256", "8"]]
+
+      Tags:
+        - Key: "Name"
+          Value: !Join ['-', [ !Ref ClusterId,  'priv-dmz','c']]
+      VpcId: !Ref VpcId
+
+#
+# Services Networks - used for lambdas and VPC endpoints
+#
+  ServicesPrivateA:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs
+          Ref: 'AWS::Region'
+      CidrBlock: !Select [ !Select [0, !Ref ServiceNetworksNumber], !Cidr [ !Ref VpcCidrBlock, "256", "8"]]
+
+      Tags:
+        - Key: "Name"
+          Value: !Join ['-', [ !Ref ClusterId,  'services','a']]
+      VpcId: !Ref VpcId
+  ServicesPrivateB:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs
+          Ref: 'AWS::Region'
+      CidrBlock: !Select [ !Select [1, !Ref ServiceNetworksNumber], !Cidr [!Ref VpcCidrBlock, "256", "8"]]
+
+      Tags:
+        - Key: "Name"
+          Value: !Join ['-', [ !Ref ClusterId,  'services','b']]
+      VpcId: !Ref VpcId
+  ServicesPrivateC:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Select
+        - 2
+        - !GetAZs
+          Ref: 'AWS::Region'
+      CidrBlock: !Select [ !Select [2, !Ref ServiceNetworksNumber], !Cidr [!Ref VpcCidrBlock, "256", "8"]]
+
+      Tags:
+        - Key: "Name"
+          Value: !Join ['-', [ !Ref ClusterId,  'services','c']]
+      VpcId: !Ref VpcId
+
+#
+# Cluster networks - isolate the hadoop and docker cluster
+#
+  ClusterPrivateA:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs
+          Ref: 'AWS::Region'
+      CidrBlock: !Select [ !Select [0, !Ref ClusterNetworksNumber], !Cidr [ !Ref VpcCidrBlock, "256", "8"]]
+
+      Tags:
+        - Key: "Name"
+          Value: !Join ['-', [ !Ref ClusterId,  'hadoop','a']]
+      VpcId: !Ref VpcId
+  ClusterPrivateB:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs
+          Ref: 'AWS::Region'
+      CidrBlock: !Select [ !Select [1, !Ref ClusterNetworksNumber], !Cidr [!Ref VpcCidrBlock, "256", "8"]]
+
+      Tags:
+        - Key: "Name"
+          Value: !Join ['-', [ !Ref ClusterId,  'hadoop','b']]
+      VpcId: !Ref VpcId
+  ClusterPrivateC:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Select
+        - 2
+        - !GetAZs
+          Ref: 'AWS::Region'
+      CidrBlock: !Select [ !Select [2, !Ref ClusterNetworksNumber], !Cidr [!Ref VpcCidrBlock, "256", "8"]]
+
+      Tags:
+        - Key: "Name"
+          Value: !Join ['-', [ !Ref ClusterId,  'hadoop','c']]
+      VpcId: !Ref VpcId
+
+
+#
+# Cluster routing table - routes between services, cluster and private DMZ
+#
+  ClusterRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VpcId
+      Tags:
+      - Key: Name
+        Value: cluster-rt
+
+  NatRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref ClusterRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateDmzARouteEntry:
+    DependsOn:
+      - PrivateDmzSubnetA
+      - ClusterRouteTable
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref PrivateDmzSubnetA
+      RouteTableId: !Ref ClusterRouteTable
+
+  PrivateDmzBRouteEntry:
+    DependsOn:
+      - PrivateDmzSubnetB
+      - ClusterRouteTable
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref PrivateDmzSubnetB
+      RouteTableId: !Ref ClusterRouteTable
+
+  PrivateDmzCRouteEntry:
+    DependsOn:
+      - PrivateDmzSubnetC
+      - ClusterRouteTable
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref PrivateDmzSubnetC
+      RouteTableId: !Ref ClusterRouteTable
+
+  ClusterARouteEntry:
+    DependsOn:
+      - ClusterPrivateA
+      - ClusterRouteTable
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref ClusterPrivateA
+      RouteTableId: !Ref ClusterRouteTable
+  ClusterBRouteEntry:
+    DependsOn:
+      - ClusterPrivateB
+      - ClusterRouteTable
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref ClusterPrivateB
+      RouteTableId: !Ref ClusterRouteTable
+  ClusterCRouteEntry:
+    DependsOn:
+      - ClusterPrivateC
+      - ClusterRouteTable
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref ClusterPrivateC
+      RouteTableId: !Ref ClusterRouteTable
+
+  ServiceARouteEntry:
+    DependsOn:
+      - ServicesPrivateA
+      - ClusterRouteTable
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref ServicesPrivateA
+      RouteTableId: !Ref ClusterRouteTable
+
+  ServiceBRouteEntry:
+    DependsOn:
+      - ServicesPrivateB
+      - ClusterRouteTable
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref ServicesPrivateB
+      RouteTableId: !Ref ClusterRouteTable
+  ServiceBRouteEntry:
+      DependsOn:
+        - ServicesPrivateC
+        - ClusterRouteTable
+      Type: "AWS::EC2::SubnetRouteTableAssociation"
+      Properties:
+        SubnetId: !Ref ServicesPrivateC
+        RouteTableId: !Ref ClusterRouteTable
+
+#
+# Private IP address - Av Zone A
+#
+  PrivateIdInterface1:
+    DependsOn: ClusterARouteEntry
+    Type: "AWS::EC2::NetworkInterface"
+    Properties:
+      Description: "master-1"
+      SubnetId: !Ref ClusterPrivateA
+      GroupSet:
+        - !Ref HadoopNodeSG
+
+  PrivateIdInterface2:
+    DependsOn: ClusterARouteEntry
+    Type: "AWS::EC2::NetworkInterface"
+    Properties:
+      Description: "master-2"
+      SubnetId: !Ref ClusterPrivateA
+      GroupSet:
+        - !Ref HadoopNodeSG
+
+  PrivateIdInterface3:
+    DependsOn: ClusterARouteEntry
+    Type: "AWS::EC2::NetworkInterface"
+    Properties:
+      Description: "master-3"
+      SubnetId: !Ref ClusterPrivateA
+      GroupSet:
+        - !Ref HadoopNodeSG
+
+  HadoopNodePolicies:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Join ['-', [ !Ref ClusterId, 'hadoop','policy']]
+      Roles:
+        - !Ref HadoopNodeRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Action:
+              - s3:ListBucket
+              - s3:Get*
+            Resource:
+              - !Sub "arn:aws:s3:::${S3ConfigBucket}"
+              - !Sub "arn:aws:s3:::${S3ConfigBucket}/*"
+
+#
+# Define Security Roles and policies
+#
+  HadoopNodeRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Join ['-', [ !Ref ClusterId,  'hadoop','role']]
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+  DockerTaskRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Join ['-', [ !Ref ClusterId,  'docker-task','role']]
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "ecs-tasks.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+  DockerExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Join ['-', [ !Ref ClusterId,  'docker-execution','role']]
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "ecs-tasks.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Join ['-', [ !Ref ClusterId,  'lambda-execution','role']]
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  DockerNodeRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Join ['-', [ !Ref ClusterId,  'ecs','role']]
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  DockerTaskPolicies:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Join ['-', [ !Ref ClusterId, 'hadoop','policy']]
+      Roles:
+        - !Ref DockerTaskRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Action:
+              - sns:Publish
+            Resource:
+              - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:*"
+          -
+            Effect: "Allow"
+            Action:
+              - s3:*
+            Resource:
+              - "arn:aws:s3:::rai-client-engines"
+              - "arn:aws:s3:::rai-client-engines/*"
+
+  DockerExecutionPolicies:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Join ['-', [ !Ref ClusterId, 'hadoop','policy']]
+      Roles:
+        - !Ref DockerExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: "*"
+          -
+            Effect: "Allow"
+            Action:
+              - sns:Publish
+            Resource:
+              - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:*"
+          -
+            Effect: "Allow"
+            Action:
+              - s3:*
+            Resource:
+              - "arn:aws:s3:::rai-client-engines"
+              - "arn:aws:s3:::rai-client-engines/*"
+
+  DockerPolicies:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Join ['-', [ !Ref ClusterId, 'ecs','policy']]
+      Roles:
+        - !Ref DockerNodeRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Action:
+              - "ecs:CreateCluster"
+              - "ecs:DeregisterContainerInstance"
+              - "ecs:DiscoverPollEndpoint"
+              - "ecs:Poll"
+              - "ecs:RegisterContainerInstance"
+              - "ecs:StartTelemetrySession"
+              - "ecs:Submit*"
+              - "ecr:GetAuthorizationToken"
+              - "ecr:BatchCheckLayerAvailability"
+              - "ecr:GetDownloadUrlForLayer"
+              - "ecr:BatchGetImage"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: "*"
+          -
+            Effect: "Allow"
+            Action:
+              - "s3:*"
+            Resource: "arn:aws:s3:::rai-static-files/*"
+          -
+            Effect: "Allow"
+            Action:
+              - "sns:Publish"
+            Resource: "*"
+
+  HadoopNodeInstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    DependsOn: HadoopNodeRole
+    Properties:
+      Roles:
+        - !Ref HadoopNodeRole
+      InstanceProfileName: !Join ['-', [ !Ref ClusterId,  'hadoop','profile' ]]
+
+  DockerNodeInstanceProfile:
+      Type: "AWS::IAM::InstanceProfile"
+      DependsOn: DockerNodeRole
+      Properties:
+        Roles:
+          - !Ref DockerNodeRole
+        InstanceProfileName: !Join ['-', [ !Ref ClusterId,  'docker','profile' ]]
+
+  PlacementGroup:
+    Type: AWS::EC2::PlacementGroup
+    Properties:
+      Strategy: cluster
+
+  # Volume1root:
+  #   Type: AWS::EC2::Volume
+  #   Properties:
+  #     Size: 10
+  #     AvailabilityZone: !GetAtt ClusterPrivateA.AvailabilityZone
+  Volume1a:
+    Type: AWS::EC2::Volume
+    Properties:
+      Size: 20
+      AvailabilityZone: !GetAtt ClusterPrivateA.AvailabilityZone
+  Volume1b:
+    Type: AWS::EC2::Volume
+    Properties:
+      Size: 20
+      AvailabilityZone: !GetAtt ClusterPrivateA.AvailabilityZone
+
+  # Volume2root:
+  #   Type: AWS::EC2::Volume
+  #   Properties:
+  #     Size: 10
+  #     AvailabilityZone: !GetAtt ClusterPrivateA.AvailabilityZone
+  Volume2a:
+    Type: AWS::EC2::Volume
+    Properties:
+      Size: 20
+      AvailabilityZone: !GetAtt ClusterPrivateA.AvailabilityZone
+  Volume2b:
+    Type: AWS::EC2::Volume
+    Properties:
+      Size: 20
+      AvailabilityZone: !GetAtt ClusterPrivateA.AvailabilityZone
+  # Volume3root:
+  #   Type: AWS::EC2::Volume
+  #   Properties:
+  #     Size: 10
+  #     AvailabilityZone: !GetAtt ClusterPrivateA.AvailabilityZone
+  Volume3a:
+    Type: AWS::EC2::Volume
+    Properties:
+      Size: 20
+      AvailabilityZone: !GetAtt ClusterPrivateA.AvailabilityZone
+  Volume3b:
+    Type: AWS::EC2::Volume
+    Properties:
+      Size: 20
+      AvailabilityZone: !GetAtt ClusterPrivateA.AvailabilityZone
+
+  SharedEFS:
+    Type: "AWS::EFS::FileSystem"
+    Properties:
+      Encrypted: false
+  SharedEFSSubnetA:
+    Type: "AWS::EFS::MountTarget"
+    Properties:
+      FileSystemId: !Ref SharedEFS
+      SecurityGroups:
+        - !Ref HadoopNodeSG
+      SubnetId: !Ref ClusterPrivateA
+  SharedEFSSubnetB:
+    Type: "AWS::EFS::MountTarget"
+    Properties:
+      FileSystemId: !Ref SharedEFS
+      SecurityGroups:
+        - !Ref HadoopNodeSG
+      SubnetId: !Ref ClusterPrivateB
+  SharedEFSSubnetC:
+    Type: "AWS::EFS::MountTarget"
+    Properties:
+      FileSystemId: !Ref SharedEFS
+      SecurityGroups:
+        - !Ref HadoopNodeSG
+      SubnetId: !Ref ClusterPrivateC
+
+  Master1Instance:
+    Type: "AWS::EC2::Instance"
+    DependsOn:
+      - ClusterPrivateA
+      - SHHadoopNodeJumpBoxIngress
+      - Master1RecordSet
+      - Master2RecordSet
+      - Master3RecordSet
+      - PlacementGroup
+    Properties:
+      ImageId: !Ref MasterNodeAmi
+      InstanceType: !Ref ClusterInstanceType
+      KeyName: !Ref ClusterKeyName
+      IamInstanceProfile: !Ref HadoopNodeInstanceProfile
+      PlacementGroupName: !Ref PlacementGroup
+      Tags:
+        - Key: Name
+          Value: master-1
+        - Key: Hostname
+          Value: master-1
+        - Key: Domain
+          Value: !Join ['.', [!Ref ClusterId, !Ref InternalDomainZone, '']]
+      NetworkInterfaces:
+        - NetworkInterfaceId: !Ref PrivateIdInterface1
+          DeviceIndex: 0
+      BlockDeviceMappings:
+        - DeviceName: "/dev/xvda"
+          Ebs:
+            VolumeSize: 50
+      Volumes:
+        # - VolumeId: !Ref Volume1root
+        #   Device: /dev/xvda
+        - VolumeId: !Ref Volume1a
+          Device: /dev/xvdf
+        - VolumeId: !Ref Volume1b
+          Device: /dev/xvdg
+
+      UserData:
+        Fn::Base64: !Sub |
+          #!/usr/bin/env bash
+          #
+          # MUST be executed as 'root'
+          # Type 'su -' first
+          #
+
+          yum update -y
+          aws configure set region ${AWS::Region}
+
+          export ACCESS_USER=rai
+          export BOX_TYPE=hadoop
+          export BOX_SUB_TYPE=master
+
+          # Main
+          export ZK_INDEX=1
+
+          #Setup
+          export S3_BUCKET=${S3ConfigBucket}
+          echo "export ACCESS_USER=$ACCESS_USER" | tee -a /etc/profile
+          echo "export BOX_TYPE=$BOX_TYPE" | tee -a /etc/profile
+          echo "export BOX_SUB_TYPE=$BOX_SUB_TYPE" | tee -a /etc/profile
+          echo "export S3_BUCKET=$S3_BUCKET" | tee -a /etc/profile
+
+          su -c "aws s3 sync s3://$S3_BUCKET/ /home/$ACCESS_USER/config" $ACCESS_USER
+          su -c "chmod ugo+x /home/$ACCESS_USER/config/scripts/*.sh"  $ACCESS_USER
+
+          /home/$ACCESS_USER/config/scripts/upgrade-scripts.sh
+
+          /home/$ACCESS_USER/config/scripts/setup.sh /home/$ACCESS_USER/config  ${ClusterId} ${InternalDomainZone} master-1
+
+
+
+
+  Master2Instance:
+    Type: "AWS::EC2::Instance"
+    DependsOn:
+      - ClusterPrivateA
+      - SHHadoopNodeJumpBoxIngress
+      - Master1RecordSet
+      - Master2RecordSet
+      - Master3RecordSet
+      - PlacementGroup
+    Properties:
+      ImageId: !Ref MasterNodeAmi
+      InstanceType: !Ref ClusterInstanceType
+      KeyName: !Ref ClusterKeyName
+      IamInstanceProfile: !Ref HadoopNodeInstanceProfile
+      PlacementGroupName: !Ref PlacementGroup
+      NetworkInterfaces:
+        - NetworkInterfaceId: !Ref PrivateIdInterface2
+          DeviceIndex: 0
+      BlockDeviceMappings:
+        - DeviceName: "/dev/xvda"
+          Ebs:
+            VolumeSize: 10
+      Volumes:
+        # - VolumeId: !Ref Volume2root
+        #   Device: /dev/xvda
+        - VolumeId: !Ref Volume2a
+          Device: /dev/xvdf
+        - VolumeId: !Ref Volume2b
+          Device: /dev/xvdg
+      Tags:
+        - Key: Name
+          Value: master-2
+        - Key: Hostname
+          Value: master-2
+        - Key: Domain
+          Value: !Join ['.', [!Ref ClusterId, !Ref InternalDomainZone]]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/usr/bin/env bash
+          #
+          # MUST be executed as 'root'
+          # Type 'su -' first
+
+          yum update -y
+          aws configure set region ${AWS::Region}
+
+          export ACCESS_USER=rai
+          export BOX_TYPE=elasticsearch
+          export BOX_SUB_TYPE=master
+          export S3_BUCKET=${S3ConfigBucket}
+
+          export ZK_INDEX=2
+
+          echo "export ACCESS_USER=$ACCESS_USER" | tee -a /etc/profile
+          echo "export BOX_TYPE=$BOX_TYPE" | tee -a /etc/profile
+          echo "export BOX_SUB_TYPE=$BOX_SUB_TYPE" | tee -a /etc/profile
+          echo "export S3_BUCKET=$S3_BUCKET" | tee -a /etc/profile
+
+          su -c "aws s3 sync s3://$S3_BUCKET/ /home/$ACCESS_USER/config" $ACCESS_USER
+          su -c "chmod ugo+x /home/$ACCESS_USER/config/scripts/*.sh"  $ACCESS_USER
+
+          /home/$ACCESS_USER/config/scripts/upgrade-scripts.sh
+
+          /home/$ACCESS_USER/config/scripts/setup.sh /home/$ACCESS_USER/config  ${ClusterId} ${InternalDomainZone} master-2
+
+
+  Master3Instance:
+    Type: "AWS::EC2::Instance"
+    DependsOn:
+      - ClusterPrivateA
+      - Master1RecordSet
+      - Master2RecordSet
+      - Master3RecordSet
+      - PlacementGroup
+    Properties:
+      ImageId: !Ref MasterNodeAmi
+      InstanceType: !Ref ClusterInstanceType
+      KeyName: !Ref ClusterKeyName
+      IamInstanceProfile: !Ref HadoopNodeInstanceProfile
+      PlacementGroupName: !Ref PlacementGroup
+      Tags:
+        - Key: Name
+          Value: master-3
+        - Key: Hostname
+          Value: master-3
+        - Key: Domain
+          Value: !Join ['.', [!Ref ClusterId, !Ref InternalDomainZone]]
+      NetworkInterfaces:
+        - NetworkInterfaceId: !Ref PrivateIdInterface3
+          DeviceIndex: 0
+      BlockDeviceMappings:
+        - DeviceName: "/dev/xvda"
+          Ebs:
+            VolumeSize: 10
+      Volumes:
+        # - VolumeId: !Ref Volume3root
+        #   Device: /dev/xvda
+        - VolumeId: !Ref Volume3a
+          Device: /dev/xvdf
+        - VolumeId: !Ref Volume3b
+          Device: /dev/xvdg
+      UserData:
+        Fn::Base64: !Sub |
+          #!/usr/bin/env bash
+          #
+          # MUST be executed as 'root'
+          # Type 'su -' first
+          #
+
+          yum update -y
+          aws configure set region ${AWS::Region}
+
+          export ACCESS_USER=rai
+          export BOX_TYPE=spark
+          export BOX_SUB_TYPE=master
+          export S3_BUCKET=${S3ConfigBucket}
+
+          export ZK_INDEX=3
+
+          echo "export ACCESS_USER=$ACCESS_USER" | tee -a /etc/profile
+          echo "export BOX_TYPE=$BOX_TYPE" | tee -a /etc/profile
+          echo "export BOX_SUB_TYPE=$BOX_SUB_TYPE" | tee -a /etc/profile
+          echo "export S3_BUCKET=$S3_BUCKET" | tee -a /etc/profile
+
+          su -c "aws s3 sync s3://$S3_BUCKET/ /home/$ACCESS_USER/config" $ACCESS_USER
+          su -c "chmod ugo+x /home/$ACCESS_USER/config/scripts/*.sh"  $ACCESS_USER
+          /home/$ACCESS_USER/config/scripts/upgrade-scripts.sh
+
+          /home/$ACCESS_USER/config/scripts/setup.sh /home/$ACCESS_USER/config ${ClusterId} ${InternalDomainZone} master-3
+
+  DockerClusterNodeLC:
+    Type: "AWS::AutoScaling::LaunchConfiguration"
+    Properties:
+      AssociatePublicIpAddress: false
+      IamInstanceProfile: !Ref DockerNodeInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 50
+      ImageId: 'ami-0150b2ec056e3c3c1'
+      InstanceMonitoring: true
+      InstanceType: !Ref DockerInstanceType
+      KeyName: !Ref ClusterKeyName
+#      LaunchConfigurationName: !Join ['-',[!Ref ClusterId, 'maestro','lc']]
+      SecurityGroups:
+        - !Ref HadoopNodeSG
+      UserData:
+        Fn::Base64: !Sub |
+          #!/usr/bin/env bash
+          yum update -y
+          yum install -y amazon-efs-utils unzip aws-cli
+          touch /etc/ecs/ecs.config
+          echo "ECS_DATADIR=/data" | tee -a /etc/ecs/ecs.config
+          echo "ECS_ENABLE_TASK_IAM_ROLE=true" | tee -a /etc/ecs/ecs.config
+          echo "ECS_ENABLE_TASK_IAM_ROLE_NETWORK_HOST=true" | tee -a /etc/ecs/ecs.config
+          echo "ECS_LOGFILE=/log/ecs-agent.log" | tee -a /etc/ecs/ecs.config
+          echo "ECS_AVAILABLE_LOGGING_DRIVERS=[\"json-file\",\"awslogs\"]" | tee -a /etc/ecs/ecs.config
+          echo "ECS_LOGLEVEL=info" | tee -a /etc/ecs/ecs.config
+          echo "ECS_CLUSTER=docker-cluster-${ClusterId}" | tee -a /etc/ecs/ecs.config
+          stop ecs && start ecs
+          mkdir /mnt/efs
+          mount -t efs ${SharedEFS}:/ /mnt/efs
+          mkdir -p /mnt/efs/client_engines
+          umount /mnt/efs
+          rm -Rf /mnt/efs
+          mkdir /mnt/client_engines
+          echo "${SharedEFS}:/client_engines /mnt/client_engines efs defaults,_netdev 0 0" | tee -a /etc/fstab
+          mount /mnt/client_engines
+          aws s3 cp s3://rai-static-files/universal-recommender/ivy_home.zip /root/ivy_home.zip
+          mkdir /var/local/rai
+          unzip /root/ivy_home.zip -d /var/local/rai/
+          rm /root/ivy_home.zip
+
+          sudo chown -R 1000 /var/local/rai/ivy_home
+          sudo chown -R 1000 /mnt/client_engines
+
+  DockerClusterNodeASG:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    Properties:
+      AutoScalingGroupName: !Join ['-', [!Ref ClusterId, 'maestro','asg']]
+      #Cooldown: 300
+      HealthCheckGracePeriod: 120
+      PlacementGroup: !Ref PlacementGroup
+      HealthCheckType: EC2
+      LaunchConfigurationName: !Ref DockerClusterNodeLC
+      VPCZoneIdentifier:
+        - !Ref ClusterPrivateA
+#        - !Ref ClusterPrivateB
+      MaxSize: 10
+      DesiredCapacity: !Ref DockerDesiredCapacity
+      MinSize: 0
+
+#
+# Interface 1 (box A)
+#
+# Hadoop master - 1
+  Master1RecordSet:
+    Type: "AWS::Route53::RecordSet"
+    Properties:
+      HostedZoneName: !Join ['' , [ !Ref InternalDomainZone ,'.']]
+      Type: A
+      TTL: '300'
+      Name: !Join ['.', [ 'master-1', !Ref ClusterId, !Ref InternalDomainZone, '']]
+      ResourceRecords:
+      - !GetAtt PrivateIdInterface1.PrimaryPrivateIpAddress
+
+
+#
+# Interface 2 (Box B)
+#
+# Elastic Search - master 1
+  Master2RecordSet:
+    Type: "AWS::Route53::RecordSet"
+    Properties:
+      HostedZoneName: !Join ['' , [ !Ref InternalDomainZone ,'.']]
+      Type: A
+      TTL: '300'
+      Name: !Join ['.', [ 'master-2', !Ref ClusterId, !Ref InternalDomainZone, '']]
+      ResourceRecords:
+      - !GetAtt PrivateIdInterface2.PrimaryPrivateIpAddress
+
+
+#
+# Interface  3 (Box C)
+#
+# Spark Master - 1
+  Master3RecordSet:
+    Type: "AWS::Route53::RecordSet"
+    Properties:
+      HostedZoneName: !Join ['' , [ !Ref InternalDomainZone ,'.']]
+      Type: A
+      TTL: '300'
+      Name: !Join ['.', [ 'master-3', !Ref ClusterId, !Ref InternalDomainZone, '']]
+      ResourceRecords:
+      - !GetAtt PrivateIdInterface3.PrimaryPrivateIpAddress
+
+  ClusterLoadBalancer:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties:
+      Scheme: 'internal'
+      SecurityGroups:
+        - !Ref HadoopNodeSG
+      Subnets:
+        - !Ref ClusterPrivateA
+        - !Ref ClusterPrivateB
+        - !Ref ClusterPrivateC
+      Type: 'application'
+      IpAddressType: 'ipv4'
+
+
+  PioEventServerTargetGroup:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      HealthCheckIntervalSeconds: 5
+      HealthCheckPath: /
+      HealthCheckPort: 7070
+      HealthCheckProtocol: 'HTTP'
+      HealthCheckTimeoutSeconds: 2
+      HealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200'
+      Name: !Join ['-', [ !Ref ClusterId, 'pio-event-server', 'tg']]
+      Port: 7070
+      Protocol: 'HTTP'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '20'
+      Targets:
+        - Id: !Ref Master3Instance
+          Port: 7070
+        - Id: !Ref Master2Instance
+          Port: 7070
+        - Id: !Ref Master1Instance
+          Port: 7070
+      TargetType: 'instance'
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VpcId
+
+  ElasticSearchTargetGroup:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      HealthCheckIntervalSeconds: 5
+      HealthCheckPath: /
+      HealthCheckPort: 9200
+      HealthCheckProtocol: 'HTTP'
+      HealthCheckTimeoutSeconds: 2
+      HealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200'
+      Name: !Join ['-', [ !Ref ClusterId, 'elasticsearch', 'tg']]
+      Port: 9200
+      Protocol: 'HTTP'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '20'
+      Targets:
+        - Id: !Ref Master3Instance
+          Port: 9200
+        - Id: !Ref Master2Instance
+          Port: 9200
+        - Id: !Ref Master1Instance
+          Port: 9200
+      TargetType: 'instance'
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VpcId
+
+  PioEventServerListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref PioEventServerTargetGroup
+      LoadBalancerArn: !Ref ClusterLoadBalancer
+      Port: 7070
+      Protocol: 'HTTP'
+
+  ElasticSearchListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ElasticSearchTargetGroup
+      LoadBalancerArn: !Ref ClusterLoadBalancer
+      Port: 9200
+      Protocol: 'HTTP'
+
+  EventServerALBRecordSet:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Join ['' , [ !Ref InternalDomainZone ,'.']]
+      RecordSets:
+      - Name: !Join ['.' , ['elasticsearch', !Ref ClusterId, !Ref InternalDomainZone ,'']]
+        Type: A
+        AliasTarget:
+          DNSName: !GetAtt ClusterLoadBalancer.DNSName
+          HostedZoneId: !GetAtt ClusterLoadBalancer.CanonicalHostedZoneID
+
+  PioEventServerALBRecordSet:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Join ['' , [ !Ref InternalDomainZone ,'.']]
+      RecordSets:
+      - Name: !Join ['.' , ['eventserver', !Ref ClusterId, !Ref InternalDomainZone ,'']]
+        Type: A
+        AliasTarget:
+          DNSName: !GetAtt ClusterLoadBalancer.DNSName
+          HostedZoneId: !GetAtt ClusterLoadBalancer.CanonicalHostedZoneID
+
+  DockerCluster:
+    Type: "AWS::ECS::Cluster"
+    Properties:
+      ClusterName: !Join ['-' , ['docker','cluster', !Ref ClusterId ]]
+
+#  S3VpcEndpoint:
+#    Type: "AWS::EC2::VPCEndpoint"
+#    Properties:
+#      RouteTableIds:
+#       - !Ref ClusterRouteTable
+#      ServiceName:  !Join [  '', [ 'com.amazonaws.' , !Ref 'AWS::Region', '.s3']]
+#      VpcId: !Ref VpcId
+#  DynamoDBVpcEndpoint:
+#    Type: "AWS::EC2::VPCEndpoint"
+#    Properties:
+#      RouteTableIds:
+#       - !Ref ClusterRouteTable
+#      ServiceName:  !Join [  '', [ 'com.amazonaws.' , !Ref 'AWS::Region', '.dynamodb']]
+#      VpcId: !Ref VpcId
+  LogsVpcEndpoint:
+    Type: "AWS::EC2::VPCEndpoint"
+    Properties:
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref ServicesPrivateA
+        - !Ref ServicesPrivateB
+        - !Ref ServicesPrivateC
+      ServiceName:  !Join [  '', [ 'com.amazonaws.' , !Ref 'AWS::Region', '.logs']]
+      VpcId: !Ref VpcId
+      SecurityGroupIds:
+        - !Ref VpcEndpointSG
+#  SnsVpcEndpoint:
+#    Type: "AWS::EC2::VPCEndpoint"
+#    Properties:
+#      VpcEndpointType: Interface
+#      PrivateDnsEnabled: true
+#      SubnetIds:
+#        - !Ref ServicesPrivateA
+#        - !Ref ServicesPrivateB
+#        - !Ref ServicesPrivateC
+#      ServiceName:  !Join [  '', [ 'com.amazonaws.' , !Ref 'AWS::Region', '.sns']]
+#      VpcId: !Ref VpcId
+#      SecurityGroupIds:
+#        - !Ref VpcEndpointSG
+  ExecuteApiVpcEndpoint:
+    Type: "AWS::EC2::VPCEndpoint"
+    Properties:
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref ServicesPrivateA
+        - !Ref ServicesPrivateB
+        - !Ref ServicesPrivateC
+      ServiceName:  !Join [  '', [ 'com.amazonaws.' , !Ref 'AWS::Region', '.execute-api']]
+      VpcId: !Ref VpcId
+      SecurityGroupIds:
+        - !Ref VpcEndpointSG
+#
+#Outputs:
+#  SmarkMaster:
+#    Description: The spark master DNS
+#    Value: !Ref Master3RecordSet
+#  HadoopMaster:
+#    Description: The hadoop master DNS
+#    Value: !Ref Master1RecordSet
+#  ElasticSearchMaster:
+#    Description: the elastic search master DNS
+#    Value: !Ref Master2RecordSet
+Feedback
+English (US)
+Terms of UsePrivacy Policy© 2008 - 2019, Amazon Web Services, Inc. or its affiliates. All rights reserved.
